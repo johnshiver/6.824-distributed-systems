@@ -68,27 +68,27 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	logger.Debug().Msg("starting worker")
 	logger.Debug().Msg("getting work")
-	j, err := GetWork(workerID)
+	w, err := GetWork(workerID)
 	if err != nil {
 		logger.Fatal().Msgf("while calling Coordinator.GetWork: %s", err)
 	}
 
-	if filesExist(j.OutputFiles) {
+	if filesExist(w.OutputFiles) {
 		logger.Fatal().Msg("job already complete, exiting")
 		return
 	}
-	for !filesExist(j.InputFiles) {
-		logger.Info().Msgf("job %s is not ready, sleeping 10 seconds", j.ID)
+	for !filesExist(w.InputFiles) {
+		logger.Info().Msgf("job %s is not ready, sleeping 10 seconds", w.ID)
 		time.Sleep(time.Second * 10)
 	}
 
 	// TODO: rather than outputs, create temp file
 	outputs := make(map[int][]KeyValue)
 
-	switch j.Kind {
+	switch w.Kind {
 	case mapper:
-		logger.Debug().Msgf("worker: %s starting map job: %s", workerID, j.ID)
-		for _, f := range j.InputFiles {
+		logger.Debug().Msgf("worker: %s starting map job: %s", workerID, w.ID)
+		for _, f := range w.InputFiles {
 			logger.Debug().Msgf("reading file: %s", f)
 			content, err := ioutil.ReadFile(f)
 			if err != nil {
@@ -112,20 +112,20 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 					logger.Error().Err(err)
 				}
 			}
-			if filesExist(j.OutputFiles) {
+			if filesExist(w.OutputFiles) {
 				logger.Debug().Msg("job already done, finishing")
 				return
 			}
-			if err = ioutil.WriteFile(fmt.Sprintf("itmd-%s-%d", j.ID, bucket), buff.Bytes(), 0444); err != nil {
+			if err = ioutil.WriteFile(fmt.Sprintf("itmd-%s-%d", w.ID, bucket), buff.Bytes(), 0444); err != nil {
 				logger.Fatal().Msgf("while writing output file: %s", err)
 			}
 		}
 		// TODO: need to write any remaining output files, in case nothing was written to that partition
 	case reducer:
-		logger.Debug().Msgf("worker: %s starting reducer job: %s", workerID, j.ID)
+		logger.Debug().Msgf("worker: %s starting reducer job: %s", workerID, w.ID)
 		var kvs []KeyValue
 		i := 0
-		for _, f := range j.InputFiles {
+		for _, f := range w.InputFiles {
 			logger.Debug().Msgf("reading file: %s", f)
 			file, err := os.Open(f)
 			if err != nil {
@@ -138,53 +138,34 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				if err := dec.Decode(&kv); err != nil {
 					break
 				}
-				logger.Debug().Msgf("kv length: %d kv capacity: %d", len(kvs), cap(kvs))
 				kvs = append(kvs, kv)
 			}
 		}
 
+		logger.Debug().Msg("sorting keys")
 		sort.Sort(ByKey(kvs))
 		buff := bytes.NewBuffer(nil)
 		i = 0
 		for i < len(kvs) {
-			k := i + 1
-			for k < len(kvs) && kvs[k].Key == kvs[i].Key {
-				k++
+			j := i + 1
+			for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+				j++
 			}
 			var values []string
-			for h := i; h < k; h++ {
+			for k := i; k < j; k++ {
 				values = append(values, kvs[k].Value)
 			}
 			output := reducef(kvs[i].Key, values)
-			_, _ = fmt.Fprintf(buff, output)
-			i = k
+			_, _ = fmt.Fprintf(buff, "%v %v\n", kvs[i].Key, output)
+			i = j
 		}
-		if err = ioutil.WriteFile(j.OutputFiles[0], buff.Bytes(), 0444); err != nil {
+		if err = ioutil.WriteFile(w.OutputFiles[0], buff.Bytes(), 0444); err != nil {
 			logger.Fatal().Msgf("while writing output file: %s", err)
 		}
-
 	}
-	logger.Debug().Msgf("%s is complete", j.ID)
-}
 
-//func reduce(kvs []KeyValue, reducef func(string, []string) string) []KeyValue {
-//	sort.Sort(ByKey(kvs))
-//	buff := bytes.NewBuffer(nil)
-//	i := 0
-//	for i < len(kvs) {
-//		k := i + 1
-//		for k < len(kvs) && kvs[k].Key == kvs[i].Key {
-//			k++
-//		}
-//		var values []string
-//		for h := i; h < k; h++ {
-//			values = append(values, kvs[k].Value)
-//		}
-//		output := reducef(kvs[i].Key, values)
-//		_, _ = fmt.Fprintf(buff, output)
-//		i = k
-//	}
-//}
+	logger.Debug().Msgf("%s is complete", w.ID)
+}
 
 func GetWork(id uuid.UUID) (GetWorkResponse, error) {
 	var response GetWorkResponse

@@ -61,28 +61,35 @@ and os.Rename to atomically rename it.
 
 */
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	// TODO: add recovery if possible to clean up job
+
+	working := true
 
 	workerID := uuid.New()
 	logger := zerolog.New(os.Stderr).With().Timestamp().Str("workerID", workerID.String()).Logger()
-
 	logger.Debug().Msg("starting worker")
-	logger.Debug().Msg("getting work")
-	w, err := GetWork(workerID)
-	if err != nil {
-		logger.Fatal().Msgf("while calling Coordinator.GetWork: %s", err)
-	}
+	for working {
+		logger.Debug().Msg("getting work")
+		w, err := GetWork(workerID)
+		if err != nil {
+			logger.Fatal().Msgf("while calling Coordinator.GetWork: %s", err)
+			working = false
+			break
+		}
 
-	if filesExist(w.OutputFiles) {
-		logger.Fatal().Msg("job already complete, exiting")
-		return
+		if filesExist(w.OutputFiles) {
+			logger.Fatal().Msg("job already complete, exiting")
+			return
+		}
+		for !filesExist(w.InputFiles) {
+			logger.Info().Msgf("job %s is not ready, sleeping 10 seconds", w.ID)
+			time.Sleep(time.Second * 10)
+		}
+		doWork(workerID, w, mapf, reducef)
 	}
-	for !filesExist(w.InputFiles) {
-		logger.Info().Msgf("job %s is not ready, sleeping 10 seconds", w.ID)
-		time.Sleep(time.Second * 10)
-	}
+}
+func doWork(workerID uuid.UUID, w GetWorkResponse, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// TODO: rather than outputs, create temp file
+	logger := zerolog.New(os.Stderr).With().Timestamp().Str("workerID", workerID.String()).Logger()
 	outputs := make(map[int][]KeyValue)
 
 	switch w.Kind {
@@ -116,7 +123,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				logger.Debug().Msg("job already done, finishing")
 				return
 			}
-			if err = ioutil.WriteFile(fmt.Sprintf("itmd-%s-%d", w.ID, bucket), buff.Bytes(), 0444); err != nil {
+			if err := ioutil.WriteFile(fmt.Sprintf("itmd-%s-%d", w.ID, bucket), buff.Bytes(), 0444); err != nil {
 				logger.Fatal().Msgf("while writing output file: %s", err)
 			}
 		}
@@ -159,7 +166,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			_, _ = fmt.Fprintf(buff, "%v %v\n", kvs[i].Key, output)
 			i = j
 		}
-		if err = ioutil.WriteFile(w.OutputFiles[0], buff.Bytes(), 0444); err != nil {
+		if err := ioutil.WriteFile(w.OutputFiles[0], buff.Bytes(), 0444); err != nil {
 			logger.Fatal().Msgf("while writing output file: %s", err)
 		}
 	}

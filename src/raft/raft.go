@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -216,7 +215,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// if entries is nil, this is heart beat
 	if args.Entries == nil {
 		lastHeard := time.Now().UTC()
-		rf.lastHeardFromLeader = &lastHeard
+		rf.lastHeardFromLeader = lastHeard
 	}
 }
 
@@ -224,7 +223,6 @@ func (rf *Raft) beginElection() error {
 	// TODO: worry about race conditions later
 
 	// after election timeout, begin election
-
 
 	// increment current term and transition to candidate
 	// TODO: maybe there should be a 'potential term' variable instead
@@ -370,11 +368,11 @@ func (rf *Raft) ticker() {
 		case Leader:
 		}
 
-
 		// once we're done all the operations, sleep
 
 		// TODO: randomize sleep
 		time.Sleep(time.Millisecond * 500)
+	}
 }
 
 // Make

@@ -83,6 +83,33 @@ type Raft struct {
 
 	electionTimeout time.Duration
 	votingTimeout   time.Duration
+
+	// if holding an election, store it here
+	currElection *Election
+}
+
+type Election struct {
+	startedAt time.Time // if curr-startedAt is greater than timeout period, re-election
+	forTerm   int       // might be able to use term on raft directly, want to separate for now
+	votes     map[int]int
+
+	mut sync.Mutex
+}
+
+func NewElection(term int) Election {
+	votes := make(map[int]int)
+	return Election{
+		startedAt: time.Now().UTC(),
+		forTerm:   term,
+		votes:     votes,
+	}
+}
+
+func (e *Election) AddVote(fromCli int) {
+	e.mut.Lock()
+	defer e.mut.Unlock()
+
+	e.votes[fromCli] += 1
 }
 
 // GetState return currentTerm and whether this server
@@ -219,58 +246,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) beginElection() error {
-	// TODO: worry about race conditions later
-
-	// after election timeout, begin election
+func (rf *Raft) beginElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	// increment current term and transition to candidate
-	// TODO: maybe there should be a 'potential term' variable instead
-	//rf.currentTerm += 1
-	//newTerm := rf.currentTerm + 1
-	// TODO: should probably create func SetCandidate with mutex protection
 	rf.state = Candidate
-
+	newElection := NewElection(rf.currentTerm + 1)
 	// current node (candidate) votes for itself and
-	// TODO: might need separate storage for this
-	votes := make(map[int]int)
-	votes[rf.me] += 1
-
-	votingTimeout := time.NewTicker(rf.votingTimeout)
-	// issue RequestVote RPCs in parallel to every other server in the cluster
-	// Candidate continues in this state unless
-	// it wins the election (has majority vote)
-	//  - receives votes from majority of servers in the full cluster for the same term
-	//  - each server will vote for at most one candidate in a given term, on a first-come-first-served basis
-	//  - once becoming leader, it sends heart beat messages to all other servers to establish its authority and prevent new elections
-	// another server establishes itself as the leader
-	// a period of time goes by with no winner
-	continueVoting := true
-	for continueVoting {
-		// if no longer a candidate, stop the process
-		if rf.state != Candidate {
-			continueVoting = false
-			_, _ = DPrintf("node is no longer a candidate, canceling vote for term: %d, %d", rf.me, rf.currentTerm)
-		}
-		select {
-		case <-votingTimeout.C:
-			continueVoting = false
-			_, _ = DPrintf("voting timed out for node: %d", rf.me)
-			// when this happens, a new election should happen
-			// new election should increment term again and initiate another round of RequestVote RPCs
-			// TODO: should break this up into logical parts, based on how this election-retry should work
-		default:
-			// TODO: sleep for some duration
-			time.Sleep(time.Millisecond * 1)
-		}
-	}
-
-	// while voting, a candidate may receive AppendEntries RPCs from another server claiming to be the leader
-	// if the leader's term (included in its RPC) is at least as large as the candidate's term, then the candidate recognizes
-	// the leader as legitimate and returns to follower state
-	// if te term in the RPC is smaller than the candidate's current term, then the candidate rejects the RPC and continues in candidate state
-
-	return nil
+	newElection.AddVote(rf.me)
+	rf.currElection = &newElection
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -361,11 +346,44 @@ func (rf *Raft) ticker() {
 			// if follower hasnt received communication since election timeout, it assumes no viable leader and begins and election to choose a new leader
 			delta := time.Now().UTC().Sub(rf.lastHeardFromLeader)
 			if delta > rf.electionTimeout {
-				// probs makes sense just to change state to candidate
 				rf.beginElection()
 			}
 		case Candidate:
+			// issue RequestVote RPCs in parallel to every other server in the cluster
+			// Candidate continues in this state unless
+			// it wins the election (has majority vote)
+			//  - receives votes from majority of servers in the full cluster for the same term
+			//  - each server will vote for at most one candidate in a given term, on a first-come-first-served basis
+			//  - once becoming leader, it sends heart beat messages to all other servers to establish its authority and prevent new elections
+			// another server establishes itself as the leader
+			// a period of time goes by with no winner
+			for i := range rf.peers {
+				// dont need to send to self
+				if i == rf.me {
+					continue
+				}
+				// TODO: in parallel
+				args := RequestVoteArgs{
+					Term:         rf.currElection.forTerm,
+					CandidateID:  rf.me,
+					LastLogIndex: rf.lastApplied,
+					LastLogTerm:  rf.currentTerm, // TODO: this is probably wrong
+				}
+				reply := RequestVoteReply{}
+				success := rf.sendRequestVote(i, &args, &reply)
+				if !success {
+					DPrintf("sendRequestVote failed: %v", args)
+					return
+				}
+				// if the vote was granted and
+				if reply.VoteGranted && reply.Term == rf.currElection.forTerm {
+					DPrintf("%d received vote from: %d for term:", rf.me, i, rf.currElection.forTerm)
+					rf.currElection.AddVote(i)
+				}
+				// TODO: handle case if vote not granted or for term is wrong
+			}
 		case Leader:
+			// send heartbeats
 		}
 
 		// once we're done all the operations, sleep

@@ -66,90 +66,24 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// each server stores current term, which increasing monotonically over time
-	// current terms are exchanged whenever servers communicate
-	// if one server's current term is smaller than the other's, then it updates its current term to the larger value
-	// if a candidate / leader discovers that its term is behind, it immediately reverts to a follower state
-	// if server receives a request with stale term number, it rejects the request
-	currentTerm     int
-	state           NodeState
-	electionTimeout time.Ticker
-	// maybe this can be done another way
-	votingTimeout time.Duration
-
-	// TODO: fill in remaining state from Figure 2
-	// TODO: define struct to hold information for each log entry
-
 	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	currentTerm int // latest term server has seen, init to 0, increase monotonically
+	votedFor    int // candidateID that received vote in current term (or -1 if none, spec says null but id prefer not to use null here)
 
-	// state ( follower | candidate | leader ) default / init should be follower
+	// volatile state
+	commitIndex int // index of the highest log entry known to be committed
+	lastApplied int // index of the highest log entry applied to state machine
 
-	// Node types
-	// Followers: Passive, they issue no requests and respond to requests from leaders and candidates
-	// Leaders: Handle all client requests. If a client contacts a follower, the follower redirects it to the leader
-	// Candidates: Used to elect new leaderes
+	// volatile state only leaders only (reinit after election)
+	nextIndex  []int // for each server, index of next log entry to send to that server. init to leader last log index + 1
+	matchIndex []int // for each server, index of the highest log entry known to be replicated on server
 
-	// Terms ----
-	// Raft divides time into terms of arbitrary length
-	// Terms are numbered with consecutive integers
-	// Each term begins with an election, as described otherwise
-	// If a candidate wins the election, then it serves as leader for the rest of the term
-	// --- Split Vote ------
-	// In this case, the term ends with no leader. A new term (with new election) begins shortly thereafter
-	// Raft guarantees there is at most one leader in a given term
-	// --- Failure cases -----
-	// In some situations a server may not observe an election or even entire terms.
-	// Terms act as a logical clock in Raft, they allow servers to detect obsolete information such as stale leaders
+	// other data that i added
+	state               NodeState
+	lastHeardFromLeader time.Time
 
-	// Leader Election Process --------
-	// A heartbeat mechanism triggers leader election
-	// When servers start up, they begin as followers
-	// A server remains in a follower state as long as it receives valid RPCs from a leader or candidate
-	// Leaders send periodic heartbeats (AppendEntries RPCs that carry no log entries) to all followers in order to maintain their authority
-	// If a follower receives no communication over a period of time called the 'election timeout' then it assumes
-	// there is no viable leader and begins an election to choose a new leader
-
-	// Beginning An Election -----
-
-	// --- Request Vote messages -------
-	// the candidate starts by voting for itself, and sends 'Request Vote' messages to the other nodes
-	// If the receiving node hasnt voted yet in this term, then it votes for the candidate, and resets its election timeout
-	// Once a candidate has a majority of votes it becomes a leader
-	// The leader begins sending out "Append Entries" messages to its followers
-	// these messages are sent in intervals specified by the "heartbeat timeout" TODO: which messages is this referring to. "Request Vote"? Think answer is yes
-	// Followers respond to each "Append Entries" message
-	// Election term will continue until a follower stops receiving heartbeats and becomes a candidate
-
-	// --- Re-election --------
-	// New node becomes leader after going through election process
-	// requiring a majority of votes guarantees that only one leader can be elected per term
-
-	// --- Split vote --------
-	// If two nodes become candidates at the same time then a split vote can occur
-	// Assuming the above, if each node reaches a single follower before the other
-	// If there is a total of 4 nodes in the cluster, each candidate will have 2 votes, neither able to reach a majority
-	// In this case, the nodes wait for a new election and try again" TODO: is there a timeout that configures this? If no majority after so and so, create a new term and move on?
-	// What happens if there is more than one term happening within a cluster? 3 / 4, 4 / 5, etc. Seems like this could increase the chance of split vote. Maybe 2N+1 helps this
-
-	// Log Replication -----
-	// all changes to the system now go through the leader
-	// each change is added as an entry in the node's log
-	// initially, log entry is uncommitted, it doesnt update the node's value
-	// to commit the entry, the node replicates it to the follower nodes
-	// the leader waits until a majority of nodes have written the entry
-	// afterwards, the leader node + node "state" is whatever the update is
-	// the leader notifies followers that the entry is committed
-	// the cluster has now come to consensus about the system state
-
-	// Log Replication in depth
-	// Change needs to be acknowledged by a majority of nodes in the cluster
-
-	// Split brain
-	// If there are two clusters with two leaders
-	// If a candidate sees a higher election term, it must step down
-
+	electionTimeout time.Duration
+	votingTimeout   time.Duration
 }
 
 // GetState return currentTerm and whether this server
@@ -220,37 +154,70 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must be exported!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+
+	Term         int
+	CandidateID  int
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 // RequestVoteReply
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
-// RequestVote
+// RequestVote ...
 // RequestVote RPCs are initiated by candidates during an election
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	DPrintf("RequestVote for node: %d", rf.me)
+
+	// reply false if term < currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = -1
+		reply.VoteGranted = false
+		return
+	}
+
+	// if votedFor is null or candidateId, and candidate's log is at least as up to date as receiver's log, grant vote
+	if (rf.votedFor < 0 || rf.votedFor == args.CandidateID) && (args.LastLogIndex >= rf.commitIndex) {
+		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
+	}
 }
 
-// RequestVoteArgs
-// RequestVote RPC arguments structure.
-// field names must be exported!
+// AppendEntriesArgs ...
 type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []byte
+	LeaderCommit int // leader's commit index
 }
 
-// RequestVoteReply
-// field names must start with capital letters!
+// AppendEntriesReply ...
 type AppendEntriesReply struct {
 	// Your data here (2A).
+	Term    int
+	Success bool // true if follower contained entry matching PrevLogIndex and PrevLogTerm
 }
 
-// RequestVote
-// RequestVote RPCs are initiated by candidates during an election
-func (rf *Raft) AppendEntries(args *RequestVoteArgs, reply *RequestVoteReply) {
+// AppendEntries ...
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
+
+	// TODO implement heartbeat code
+
+	// if entries is nil, this is heart beat
+	if args.Entries == nil {
+		lastHeard := time.Now().UTC()
+		rf.lastHeardFromLeader = &lastHeard
+	}
 }
 
 func (rf *Raft) beginElection() error {
@@ -258,10 +225,6 @@ func (rf *Raft) beginElection() error {
 
 	// after election timeout, begin election
 
-	// TODO: must be a follower?
-	if rf.state != Follower {
-		return fmt.Errorf("cant start election, not a follower: %d", rf.state)
-	}
 
 	// increment current term and transition to candidate
 	// TODO: maybe there should be a 'potential term' variable instead
@@ -344,6 +307,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -390,23 +358,23 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		// if leader, send heart beat (empty append entries)
-		if _, isLeader := rf.GetState(); isLeader {
-			// rf.sendAppendEntries()
-
-		}
-		select {
-		case <-rf.electionTimeout.C:
-			err := rf.beginElection()
-			if err != nil {
-				_, _ = DPrintf("%w", err)
+		switch rf.state {
+		case Follower:
+			// if follower hasnt received communication since election timeout, it assumes no viable leader and begins and election to choose a new leader
+			delta := time.Now().UTC().Sub(rf.lastHeardFromLeader)
+			if delta > rf.electionTimeout {
+				// probs makes sense just to change state to candidate
+				rf.beginElection()
 			}
-
-		default:
-			// be started and to randomize sleeping time using
-			// TODO: randomize sleep
-			time.Sleep(time.Millisecond * 500)
+		case Candidate:
+		case Leader:
 		}
-	}
+
+
+		// once we're done all the operations, sleep
+
+		// TODO: randomize sleep
+		time.Sleep(time.Millisecond * 500)
 }
 
 // Make
@@ -427,6 +395,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	// when servers start up, they begin as followers
+	// Follower is the default value, but better to be explicit
+	rf.state = Follower
 
 	// randomize electionTimeout, between 150-300 ms
 	// want to spread out servers so that in most cases only a single server will timeout

@@ -245,6 +245,11 @@ type RequestVoteReply struct {
 // RequestVote ...
 // RequestVote RPCs are initiated by candidates during an election
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// TODO might need to be careful with all these locks, could be deadlock
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	// Your code here (2A, 2B).
 	DPrintf("RequestVote for node: %d", rf.me)
 
@@ -259,10 +264,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 		// if votedFor is null or candidateId, and candidate's log is at least as up to date as receiver's log, grant vote
-		//if (rf.votedFor < 0 || rf.votedFor == args.CandidateID) && (args.LastLogIndex >= rf.commitIndex) {
-		//	reply.VoteGranted = true
-		//	reply.Term = rf.currentTerm
-		//}
+		if (rf.followerData.votedFor < 0 || rf.followerData.votedFor == args.CandidateID) && (args.LastLogIndex >= rf.commitIndex) {
+			reply.VoteGranted = true
+			reply.Term = rf.followerData.currTerm
+			rf.followerData.votedFor = args.CandidateID
+		}
 	case Leader:
 		// TODO: check what to do here
 	}
@@ -300,6 +306,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.followerData.lastHeardFromLeader = time.Now().UTC()
 	case Leader:
 		// TODO: not sure what
+		// if AppendEntries RPC received, convert to follower
+		rf.TransitionToFollower(args.LeaderID, args.Term, -1)
 	}
 }
 

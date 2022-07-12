@@ -55,11 +55,11 @@ type NodeState int8
 func (ns NodeState) String() string {
 	switch ns {
 	case Follower:
-		return "Follower"
+		return "follower"
 	case Candidate:
-		return "Candidate"
+		return "candidate"
 	case Leader:
-		return "Leader"
+		return "leader"
 	}
 
 	return "invalid state"
@@ -102,11 +102,18 @@ type Raft struct {
 	votingTimeout   time.Duration
 }
 
-func (r *Raft) SetCurrTerm(term int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (rf *Raft) SetCurrTerm(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	r.currTerm = term
+	rf.currTerm = term
+}
+
+func (rf *Raft) GetNodeState() NodeState {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.state
 }
 
 type FollowerMetaData struct {
@@ -124,8 +131,16 @@ func (fmd *FollowerMetaData) Update(votedFor int) {
 	fmd.votedFor = votedFor
 }
 
+func (fmd *FollowerMetaData) GetLastHeardFrom() time.Time {
+	fmd.mu.Lock()
+	defer fmd.mu.Unlock()
+
+	return fmd.lastHeardFromLeader
+
+}
+
 type CandidateMetaData struct {
-	election Election
+	election *Election
 }
 
 type LeaderMetaData struct{}
@@ -139,9 +154,9 @@ type Election struct {
 	mut sync.Mutex
 }
 
-func NewElection(forCandidate, term, clientCount int) Election {
+func NewElection(forCandidate, term, clientCount int) *Election {
 	votes := make([]int, clientCount)
-	return Election{
+	return &Election{
 		startedAt:    time.Now().UTC(),
 		forTerm:      term,
 		votes:        votes,
@@ -288,11 +303,15 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
 	DPrintf("server (%s) %d: received RequestVote from %d", rf.state, rf.me, args.CandidateID)
+	rf.mu.Unlock()
 
-	switch rf.state {
+	currTerm, _ := rf.GetState()
+
+	switch rf.GetNodeState() {
 	case Candidate, Leader:
-		if args.Term > rf.currTerm {
+		if args.Term > currTerm {
 			rf.TransitionToFollower(args.CandidateID, args.Term, -1)
 			// TODO: add conditions back in
 
@@ -302,7 +321,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	case Follower:
 		// if vote request is for an old term, say no
-		if args.Term < rf.currTerm {
+		if args.Term < currTerm {
 			reply.Term = -1
 			reply.VoteGranted = false
 			return
@@ -346,7 +365,9 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
 
+	rf.mu.Lock()
 	DPrintf("server (%s): %d, received AppendEntries from %d", rf.state, rf.me, args.LeaderID)
+	rf.mu.Unlock()
 
 	switch rf.state {
 	case Candidate, Leader:
@@ -469,8 +490,9 @@ func (rf *Raft) Kill() {
 	DPrintf("server %d: killed", rf.me)
 
 	// TODO: seems to make sense to reset these
-	rf.state = Follower
-	rf.currTerm = 0
+	//rf.state = Follower
+	//rf.currTerm = 0
+	//rf.followerData = FollowerMetaData{}
 }
 
 func (rf *Raft) killed() bool {
@@ -482,28 +504,27 @@ func (rf *Raft) killed() bool {
 // heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		switch rf.state {
+		switch rf.GetNodeState() {
 		case Follower:
 			// if follower hasnt received communication since election timeout, it assumes no viable leader and begins and election to choose a new leader
-			delta := time.Now().UTC().Sub(rf.followerData.lastHeardFromLeader)
+			delta := time.Now().UTC().Sub(rf.followerData.GetLastHeardFrom())
 			if delta > rf.electionTimeout {
-				DPrintf("server %d: election time out", rf.me)
+				DPrintf("node %d: election time out", rf.me)
 				rf.TransitionToCandidate(rf.currTerm + 1)
 			}
 		case Candidate:
-
 			// if candidate has majority, transition to leader
 			if rf.candidateData.election.CandidateHasMajority() {
-				DPrintf("server %d: has received a majority of votes for term: %d", rf.me, rf.candidateData.election.forTerm)
+				DPrintf("node %d: has received a majority of votes for term: %d", rf.me, rf.candidateData.election.forTerm)
 				rf.TransitionToLeader(rf.candidateData.election.forTerm)
 				continue
 			}
 
 			// if election timeout, start a new election
 			delta := time.Now().UTC().Sub(rf.candidateData.election.startedAt)
-			if delta > rf.electionTimeout {
+			if delta > rf.votingTimeout {
 				//  start a new election
-				DPrintf("server %d: election timeout during active election, starting new election", rf.me)
+				DPrintf("node %d: election timeout during active election, starting new election", rf.me)
 				newElection := NewElection(rf.me, rf.candidateData.election.forTerm+1, len(rf.peers))
 				rf.candidateData.election = newElection
 				continue
@@ -511,14 +532,13 @@ func (rf *Raft) ticker() {
 
 			// otherwise, send out votes
 
-			DPrintf("server %d: sending out RequestVotes", rf.me)
+			DPrintf("node %d: sending RequestVotes", rf.me)
 			var wg sync.WaitGroup
 			for i := range rf.peers {
 				// dont need to send to self
 				if i == rf.me {
 					continue
 				}
-				// TODO: in parallel
 				wg.Add(1)
 				go func(rec int) {
 					defer wg.Done()
@@ -531,7 +551,7 @@ func (rf *Raft) ticker() {
 					reply := RequestVoteReply{}
 					success := rf.sendRequestVote(rec, &args, &reply)
 					if !success {
-						DPrintf("sendRequestVote failed: %v", args)
+						DPrintf("node %d: sendRequestVote failed for term: %d", rf.me, args.Term)
 						return
 					}
 					// if the vote was granted and
@@ -565,7 +585,7 @@ func (rf *Raft) ticker() {
 					reply := AppendEntriesReply{}
 					success := rf.sendAppendEntries(rec, &args, &reply)
 					if !success {
-						DPrintf("server %d: sendAppendEntries to %d failed: %d", rf.me, rec, args.Term)
+						DPrintf("node %d: sendAppendEntries to %d failed: %d", rf.me, rec, args.Term)
 					}
 					// TODO: handle these later
 				}(i)
@@ -574,9 +594,8 @@ func (rf *Raft) ticker() {
 		}
 
 		// once we're done all the operations, sleep
-
-		timeout := rand.Intn(100) + 300
-		time.Sleep(time.Millisecond * time.Duration(timeout))
+		// TODO: not sure how the timeouts should look
+		time.Sleep(time.Millisecond * 50)
 	}
 }
 
@@ -594,11 +613,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 
+	// TODO: w
 	rand.Seed(time.Now().UnixNano())
-	timeout := rand.Intn(200) + 1000
-
-	rf.electionTimeout = time.Duration(timeout) * time.Millisecond
-	rf.votingTimeout = time.Duration(timeout) * time.Millisecond
+	electionTO := rand.Intn(200) + 1000
+	votingTO := rand.Intn(200) + 1000
+	rf.electionTimeout = time.Duration(electionTO) * time.Millisecond
+	rf.votingTimeout = time.Duration(votingTO) * time.Millisecond
 
 	rf.peers = peers
 	rf.persister = persister
